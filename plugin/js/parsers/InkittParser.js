@@ -34,19 +34,23 @@ class InkittParser extends Parser {
         let payload = [...dom.querySelectorAll("script:not([src])")]
             .map(script => this.decodePayloadChunk(script.textContent))
             .join("");
-        let entry = new RegExp("\"name\":\"((?:[^\"\\\\]|\\\\.)*)\",\"original_name\":\"(?:[^\"\\\\]|\\\\.)*\",\"path\":\"(/stories/" + storyId + "/chapters/\\d+)\"", "g");
+        let entry = new RegExp("\"number\":(\\d+),\"name\":\"((?:[^\"\\\\]|\\\\.)*)\",\"original_name\":\"(?:[^\"\\\\]|\\\\.)*\",\"path\":\"(/stories/" + storyId + "/chapters/\\d+)\"", "g");
         let chapters = new Map();
         for (let match of payload.matchAll(entry)) {
-            let sourceUrl = new URL(match[2], dom.baseURI).href;
+            let sourceUrl = new URL(match[3], dom.baseURI).href;
             let number = this.chapterNumber(sourceUrl);
             if (!chapters.has(number)) {
-                chapters.set(number, {sourceUrl: sourceUrl, title: this.unescapeJsonString(match[1]).trim()});
+                chapters.set(number, {
+                    sourceUrl: sourceUrl,
+                    title: match[1] + ". " + this.unescapeJsonString(match[2]).trim()
+                });
             }
         }
         for (let link of dom.querySelectorAll("a[href*=\"/stories/" + storyId + "/chapters/\"]")) {
             let number = this.chapterNumber(link.href);
             if (!chapters.has(number)) {
-                chapters.set(number, {sourceUrl: link.href, title: link.textContent.replace(/\s+/g, " ").trim()});
+                let name = link.textContent.replace(/\s+/g, " ").trim().replace(/^\d+\s+/, "");
+                chapters.set(number, {sourceUrl: link.href, title: number + ". " + name});
             }
         }
         return [...chapters.values()].sort((a, b) => this.chapterNumber(a.sourceUrl) - this.chapterNumber(b.sourceUrl));
@@ -88,8 +92,9 @@ class InkittParser extends Parser {
     }
 
     extractAuthor(dom) {
-        let author = dom.querySelector("span[id=\"storyAuthor\"], a.author-link .name, a.author-link")?.textContent?.trim()
-            ?? dom.querySelector("meta[property=\"author\"]")?.content?.trim();
+        let author = dom.querySelector("meta[name=\"author\"], meta[property=\"author\"]")?.content?.trim()
+            || [...dom.querySelectorAll("#storyAuthor, a.author-link")].map(e => e.textContent.trim()).find(text => text !== "")
+            || dom.title.match(/ by (.+) at Inkitt$/)?.[1]?.trim();
         return author || super.extractAuthor(dom);
     }
 
