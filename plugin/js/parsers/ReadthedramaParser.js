@@ -8,6 +8,8 @@ parserFactory.register("readthedrama.com", () => new ReadthedramaParser());
 class ReadthedramaParser extends Parser { // eslint-disable-line no-unused-vars
     constructor() {
         super();
+        this.minimumThrottle = 9000;
+        this.tocTitles = new Map();
     }
 
     /**
@@ -18,9 +20,11 @@ class ReadthedramaParser extends Parser { // eslint-disable-line no-unused-vars
         const found = dom.querySelectorAll("div.divide-y a");
 
         return Array.from(found, anchor => {
+            let title = anchor.querySelector("span:first-of-type").textContent.trim();
+            this.tocTitles.set(anchor.href, title);
             return {
                 sourceUrl: anchor.href,
-                title: anchor.querySelector("span:first-of-type").textContent.trim()
+                title: title
             };
         });
     }
@@ -34,41 +38,93 @@ class ReadthedramaParser extends Parser { // eslint-disable-line no-unused-vars
 
     async fetchChapter(url) {
         let dom = await super.fetchChapter(url);
-        let contentNode = this.findContent(dom);
-        
-        if (!contentNode) {
-            let scripts = dom.querySelectorAll("script");
-            for (let script of scripts) {
-                let text = script.textContent.trim();
-                if (text.startsWith("self.__next_f.push")) {
-                    let match = text.match(/self\.__next_f\.push\((.+)\)/);
-                    if (match) {
-                        try {
-                            let arr = JSON.parse(match[1]);
-                            if (arr && arr.length > 1 && typeof arr[1] === "string") {
-                                let str = arr[1];
-                                // Check if it's the chapter content string
-                                if (!str.match(/^[0-9a-f]+:/) && (str.includes("\n\n") || str.length > 500)) {
-                                    let article = dom.createElement("article");
-                                    article.className = "chapter-text";
-                                    let paragraphs = str.split("\n\n");
-                                    for (let p of paragraphs) {
-                                        let pNode = dom.createElement("p");
-                                        pNode.textContent = p.trim();
-                                        article.appendChild(pNode);
-                                    }
-                                    dom.body.appendChild(article);
-                                    break;
-                                }
-                            }
-                        } catch (e) {
-                            // ignore parsing errors and continue
-                        }
-                    }
+        let text = await ReadthedramaParser.decodeChapter(dom);
+        let article = dom.createElement("article");
+        article.className = "chapter-text";
+
+        let titleText = dom.querySelector("h2.font-bold")?.textContent.replace(/\s+/g, " ").trim()
+            || this.tocTitles.get(url);
+        if (titleText) {
+            let title = dom.createElement("h1");
+            title.textContent = titleText;
+            article.appendChild(title);
+        }
+
+        let paragraphs = text
+            .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000\uFEFF]/g, " ")
+            .split("\n\n")
+            .filter(p => p.trim() !== "");
+        for (let paragraph of paragraphs) {
+            let p = dom.createElement("p");
+            p.textContent = paragraph.trim();
+            article.appendChild(p);
+        }
+        dom.body.appendChild(article);
+        return dom;
+    }
+
+    static getFlightPayload(dom) {
+        let payload = "";
+        for (let script of dom.querySelectorAll("script")) {
+            let match = /^self\.__next_f\.push\((\[[\s\S]*\])\)\s*;?$/.exec(script.textContent.trim());
+            if (!match) {
+                continue;
+            }
+            try {
+                let entry = JSON.parse(match[1]);
+                if (entry[0] === 1 && typeof entry[1] === "string") {
+                    payload += entry[1];
                 }
+            } catch (e) {
+                // not a flight chunk, skip
             }
         }
-        return dom;
+        return payload;
+    }
+
+    static async decodeChapter(dom) {
+        const KEY = "rtd-ch-9f3a71c4d8e25b06";
+        let payload = ReadthedramaParser.getFlightPayload(dom);
+
+        let ref = /"encodedContent":"\$([0-9a-f]+)"/.exec(payload);
+        let meta = /"novelSlug":"([^"]+)","chapterNumber":(\d+)/.exec(payload);
+        if (!ref || !meta) {
+            throw new Error("Could not find encoded chapter data in page.");
+        }
+        let header = new RegExp("(?:^|\\n)" + ref[1] + ":T([0-9a-f]+),").exec(payload);
+        if (!header) {
+            throw new Error("Could not find encoded chapter blob in page.");
+        }
+        let start = header.index + header[0].length;
+        let blob = payload.substr(start, parseInt(header[1], 16));
+
+        let binary = atob(blob);
+        let bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; ++i) {
+            bytes[i] = binary.charCodeAt(i);
+        }
+
+        let seedText = KEY + ":" + meta[1] + ":" + meta[2];
+        let s = 0x811c9dc5;
+        for (let i = 0; i < seedText.length; ++i) {
+            s ^= seedText.charCodeAt(i);
+            s = Math.imul(s, 0x1000193);
+        }
+        s = (s >>> 0) || 0x9e3779b9;
+
+        let xored = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; ++i) {
+            s ^= s << 13;
+            s >>>= 0;
+            s ^= s >>> 17;
+            s ^= s << 5;
+            s >>>= 0;
+            xored[i] = bytes[i] ^ (255 & s);
+        }
+
+        let stream = new Blob([xored]).stream().pipeThrough(new DecompressionStream("deflate"));
+        let inflated = new Uint8Array(await new Response(stream).arrayBuffer());
+        return new TextDecoder().decode(inflated);
     }
 
     /**
